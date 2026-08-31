@@ -1002,6 +1002,7 @@ def my_tournaments():
                 "status": status,
                 "is_winner": is_winner,
                 "winner": winner_name,
+                "winner_id": str(t.get("winner_id", "")) if t.get("winner_id") else None,
                 "format": t.get("format", "quick"),
                 "banner_image": t.get("banner_image"),
                 "has_bracket": bool(t.get("bracket")),

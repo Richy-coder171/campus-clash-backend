@@ -241,6 +241,61 @@ def profile():
     })
 
 
+# PUBLIC PROFILE (view any user by ID)
+@auth.route("/profile/<user_id>", methods=["GET"])
+@jwt_required()
+def public_profile(user_id):
+
+    try:
+        uid = ObjectId(user_id)
+    except Exception:
+        return jsonify({"error": "Invalid user ID"}), 400
+
+    user = mongo.db.users.find_one({"_id": uid})
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    registrations = list(mongo.db.registrations.find({"user_id": user_id}))
+    tournaments_joined = sum(1 for r in registrations if r.get("payment_status") == "approved")
+
+    wins = 0
+    prize_won = 0
+    for r in registrations:
+        if r.get("payment_status") != "approved":
+            continue
+        t = mongo.db.tournaments.find_one({"_id": r.get("tournament_id")})
+        if t and t.get("winner_id") == user_id:
+            wins += 1
+            prize_won += t.get("prize_pool", 0)
+
+    win_rate = round((wins / tournaments_joined * 100), 1) if tournaments_joined > 0 else 0
+
+    created_at = user.get("created_at", "")
+    joined_label = ""
+    if created_at:
+        from datetime import datetime
+        try:
+            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            joined_label = dt.strftime("%b %Y")
+        except Exception:
+            joined_label = ""
+
+    return jsonify({
+        "user_id": user_id,
+        "name": user.get("name", ""),
+        "username": user.get("username", ""),
+        "college": user.get("college", ""),
+        "role": user.get("role", "player"),
+        "joined": joined_label,
+        "stats": {
+            "tournaments_joined": tournaments_joined,
+            "wins": wins,
+            "prize_won": prize_won,
+            "win_rate": win_rate,
+        }
+    })
+
+
 # REFRESH ACCESS TOKEN
 @auth.route("/refresh", methods=["POST"])
 @jwt_required(refresh=True)
