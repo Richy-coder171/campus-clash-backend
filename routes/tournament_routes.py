@@ -1222,7 +1222,7 @@ def declare_winner():
     # Also increment tournaments_played for the winner if first time
     # (only if they don't already have a stats record for this game)
     from routes.player_stats_routes import get_player_stats as _get_stats
-    existing_stats = _get_stats(winner_id, game)
+    existing_stats = _get_stats(mongo, winner_id, game)
     if existing_stats.get("tournaments_played", 0) == 0:
         upsert_player_stats(winner_id, game, tournaments_played_delta=1)
 

@@ -243,7 +243,6 @@ def profile():
 
 # PUBLIC PROFILE (view any user by ID)
 @auth.route("/profile/<user_id>", methods=["GET"])
-@jwt_required()
 def public_profile(user_id):
 
     try:
@@ -286,6 +285,7 @@ def public_profile(user_id):
         "username": user.get("username", ""),
         "college": user.get("college", ""),
         "role": user.get("role", "player"),
+        "avatarId": str(user.get("avatarId", "")) if user.get("avatarId") else None,
         "joined": joined_label,
         "stats": {
             "tournaments_joined": tournaments_joined,
