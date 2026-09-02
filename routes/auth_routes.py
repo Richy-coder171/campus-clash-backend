@@ -737,3 +737,37 @@ def admin_change_in_game_name():
         "old_name": old_name,
         "new_name": new_name
     })
+
+
+# ---------------------------------------------------------------------------
+# USER SEARCH (for admin notification targeting)
+# ---------------------------------------------------------------------------
+
+@auth.route("/search-users", methods=["GET"])
+@jwt_required()
+def search_users():
+    query = (request.args.get("q") or "").strip()
+    try:
+        limit = min(int(request.args.get("limit", 10)), 25)
+    except (ValueError, TypeError):
+        limit = 10
+
+    if len(query) < 2:
+        return jsonify({"users": []})
+
+    regex = re.compile(re.escape(query), re.IGNORECASE)
+
+    users = list(mongo.db.users.find(
+        {"$or": [{"username": regex}, {"email": regex}]}
+    ).limit(limit))
+
+    data = []
+    for u in users:
+        data.append({
+            "id": str(u["_id"]),
+            "username": u.get("username", ""),
+            "email": u.get("email", ""),
+            "role": u.get("role", "user"),
+        })
+
+    return jsonify({"users": data})
