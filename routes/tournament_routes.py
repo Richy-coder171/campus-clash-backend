@@ -948,6 +948,107 @@ def reject_payment(registration_id):
     return jsonify({"message": "Payment Rejected"})
 
 
+# ---------------- ADMIN - DISQUALIFY TEAM ----------------
+@tournament.route("/admin/disqualify/<registration_id>", methods=["POST"])
+@admin_required
+def disqualify_team(registration_id):
+    reg = mongo.db.registrations.find_one({"_id": ObjectId(registration_id)})
+    if not reg:
+        return jsonify({"error": "Registration not found"}), 404
+
+    if reg.get("payment_status") == "disqualified":
+        return jsonify({"message": "Already disqualified"})
+
+    if reg.get("payment_status") != "approved":
+        return jsonify({"error": "Can only disqualify approved teams"}), 400
+
+    mongo.db.registrations.update_one(
+        {"_id": ObjectId(registration_id)},
+        {"$set": {"payment_status": "disqualified"}}
+    )
+
+    # Remove from tournament players array
+    mongo.db.tournaments.update_one(
+        {"_id": ObjectId(reg["tournament_id"])},
+        {"$pull": {"players": reg["user_id"]}}
+    )
+
+    t = mongo.db.tournaments.find_one({"_id": ObjectId(reg["tournament_id"])})
+    tname = t.get("name") if t else "a tournament"
+
+    # Notify leader
+    create_notification(
+        mongo,
+        reg["user_id"],
+        f"Your team \"{reg.get('team_name', 'Unknown')}\" has been disqualified from \"{tname}\".",
+        ntype="info",
+        tournament_id=str(reg["tournament_id"])
+    )
+
+    # Notify team members
+    for member in reg.get("team_members", []):
+        member_uid = member.get("user_id")
+        if member_uid and member_uid != reg["user_id"]:
+            create_notification(
+                mongo,
+                member_uid,
+                f"Your team \"{reg.get('team_name', 'Unknown')}\" has been disqualified from \"{tname}\".",
+                ntype="info",
+                tournament_id=str(reg["tournament_id"])
+            )
+
+    return jsonify({"message": "Team disqualified successfully"})
+
+
+# ---------------- ADMIN - RE-QUALIFY TEAM ----------------
+@tournament.route("/admin/re-qualify/<registration_id>", methods=["POST"])
+@admin_required
+def requalify_team(registration_id):
+    reg = mongo.db.registrations.find_one({"_id": ObjectId(registration_id)})
+    if not reg:
+        return jsonify({"error": "Registration not found"}), 404
+
+    if reg.get("payment_status") != "disqualified":
+        return jsonify({"error": "Team is not disqualified"}), 400
+
+    mongo.db.registrations.update_one(
+        {"_id": ObjectId(registration_id)},
+        {"$set": {"payment_status": "approved"}}
+    )
+
+    # Re-add to tournament players array
+    mongo.db.tournaments.update_one(
+        {"_id": ObjectId(reg["tournament_id"])},
+        {"$addToSet": {"players": reg["user_id"]}}
+    )
+
+    t = mongo.db.tournaments.find_one({"_id": ObjectId(reg["tournament_id"])})
+    tname = t.get("name") if t else "a tournament"
+
+    # Notify leader
+    create_notification(
+        mongo,
+        reg["user_id"],
+        f"Your team \"{reg.get('team_name', 'Unknown')}\" has been re-qualified for \"{tname}\".",
+        ntype="info",
+        tournament_id=str(reg["tournament_id"])
+    )
+
+    # Notify team members
+    for member in reg.get("team_members", []):
+        member_uid = member.get("user_id")
+        if member_uid and member_uid != reg["user_id"]:
+            create_notification(
+                mongo,
+                member_uid,
+                f"Your team \"{reg.get('team_name', 'Unknown')}\" has been re-qualified for \"{tname}\".",
+                ntype="info",
+                tournament_id=str(reg["tournament_id"])
+            )
+
+    return jsonify({"message": "Team re-qualified successfully"})
+
+
 # ---------------- MY TOURNAMENTS ----------------
 @tournament.route("/my-tournaments", methods=["GET"])
 @jwt_required()
@@ -964,11 +1065,17 @@ def my_tournaments():
     }))
 
     data = []
+    seen_tournaments = set()
 
     for r in registrations:
 
+        tid = r["tournament_id"]
+        if tid in seen_tournaments:
+            continue
+        seen_tournaments.add(tid)
+
         t = mongo.db.tournaments.find_one({
-            "_id": ObjectId(r["tournament_id"])
+            "_id": ObjectId(tid)
         })
 
         if t:
@@ -1004,10 +1111,14 @@ def my_tournaments():
                 "winner": winner_name,
                 "winner_id": str(t.get("winner_id", "")) if t.get("winner_id") else None,
                 "format": t.get("format", "quick"),
+                "mode": t.get("mode", "solo"),
+                "team_size": t.get("team_size", 1),
                 "banner_image": t.get("banner_image"),
                 "has_bracket": bool(t.get("bracket")),
                 "team_name": r.get("team_name"),
-                "role": role
+                "role": role,
+                "scheduled_time": _format_deadline_iso(t.get("scheduled_time")),
+                "registration_end_time": _format_deadline_iso(t.get("registration_end_time")),
             })
 
     return jsonify(data)
@@ -1062,7 +1173,7 @@ def release_room(tournament_id):
         except (ValueError, AttributeError):
             return jsonify({"error": "Invalid start_time format"}), 400
 
-    # Validate slot assignments (10 slots max)
+    # Validate slot assignments (hardcoded 10)
     if slot_assignments:
         if not isinstance(slot_assignments, dict):
             return jsonify({"error": "slot_assignments must be an object"}), 400

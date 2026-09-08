@@ -61,17 +61,29 @@ def get_tournament_scoring(tournament_id):
 def get_roster_by_id(tournament_id):
     registrations = mongo.db.registrations.find({
         "tournament_id": ObjectId(tournament_id),
-        "payment_status": "approved"
+        "payment_status": {"$nin": ["rejected", "disqualified"]}
     })
     roster = {}
+    seen_keys = set()
     for r in registrations:
+        team_name = r.get("team_name")
+        team_members = r.get("team_members", []) or []
+
+        # Build dedup key: sorted member IDs catch duplicate squad registrations
+        member_ids = sorted([str(mid) for mid in team_members])
+        dedup_key = "|".join(member_ids) if member_ids else str(r.get("user_id", ""))
+
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+
         user = mongo.db.users.find_one({"_id": safe_object_id(r.get("user_id"))})
-        display_name = r.get("team_name") or (user.get("name") if user else "Unknown")
+        display_name = team_name or (user.get("name") if user else "Unknown")
         roster[str(r["_id"])] = {
             "registration_id": str(r["_id"]),
             "user_id": r.get("user_id"),
             "name": display_name,
-            "team_members": r.get("team_members", []),
+            "team_members": team_members,
             "team_leader": r.get("team_leader")
         }
     return roster
@@ -117,11 +129,11 @@ def serialize_cross_pod_match(m):
                 "team_name": reg.get("team_name", "Unknown")
             }
 
-    return {
+    out = {
         "id": str(m["_id"]),
         "round_robin_id": str(m["round_robin_id"]),
-        "pod_a_id": str(m["pod_a_id"]),
-        "pod_b_id": str(m["pod_b_id"]),
+        "pod_a_id": str(m["pod_a_id"]) if m.get("pod_a_id") else None,
+        "pod_b_id": str(m["pod_b_id"]) if m.get("pod_b_id") else None,
         "pod_a_name": m.get("pod_a_name", ""),
         "pod_b_name": m.get("pod_b_name", ""),
         "match_number": m["match_number"],
@@ -130,11 +142,19 @@ def serialize_cross_pod_match(m):
         "room_password": m.get("room_password"),
         "match_start_time": m.get("match_start_time"),
         "slot_assignments": resolved_slots,
+        "full_lobby": m.get("full_lobby", False),
+        "slot_limit": m.get("slot_limit", 10),
         "status": m.get("status", "scheduled"),
         "results": m.get("results", []),
         "mvp": m.get("mvp"),
         "created_at": m.get("created_at"),
     }
+
+    # Include participants for full-lobby matches
+    if m.get("full_lobby") and m.get("participants"):
+        out["participants"] = m["participants"]
+
+    return out
 
 
 def serialize_round_robin(rr, include_matches=False):
@@ -301,6 +321,143 @@ def create_round_robin(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 
+# ---------------- CREATE FULL LOBBY MATCHES (12 teams, no groups) ----------------
+@cross_pod.route("/<tournament_id>/create-full-lobby", methods=["POST"])
+@admin_required
+def create_full_lobby(tournament_id):
+    """Create full-lobby matches where all teams play together (no group system).
+    Used for league/tournament format where every match has all teams.
+
+    Expects JSON:
+      - stage_id: the stage whose roster to use
+      - name: e.g. "Day 1 - Full Lobby"
+      - match_count (optional): number of matches to create (default 3, max 3)
+    """
+    try:
+        t = mongo.db.tournaments.find_one({"_id": safe_object_id(tournament_id)})
+        if not t:
+            return jsonify({"error": "Tournament not found"}), 404
+
+        data = request.get_json(silent=True) or {}
+        stage_id = data.get("stage_id")
+        name = data.get("name") or "Full Lobby"
+        match_count = min(int(data.get("match_count") or 3), 3)  # Max 3 matches
+
+        # Get all approved (non-disqualified) participants
+        roster = get_roster_by_id(tournament_id)
+        participants = list(roster.values())
+
+        if len(participants) < 2:
+            return jsonify({"error": "Need at least 2 approved participants"}), 400
+
+        # Hardcoded 12 slots
+        slot_limit = 12
+
+        # Check if there's an existing round-robin for this stage (or tournament-level)
+        query = {"tournament_id": ObjectId(tournament_id)}
+        if stage_id:
+            query["stage_id"] = ObjectId(stage_id)
+        else:
+            query["stage_id"] = {"$exists": False}
+
+        existing_rr = mongo.db.cross_pod_round_robin.find_one(query)
+
+        if existing_rr:
+            rr_id = existing_rr["_id"]
+            existing_count = mongo.db.cross_pod_matches.count_documents({"round_robin_id": rr_id})
+            start_num = existing_count + 1
+
+            maps = ["Bermuda", "Pulgatory", "Kalahari", "Livik", "Sanhok"]
+            created_matches = []
+
+            for i in range(match_count):
+                match_num = start_num + i
+                map_name = maps[i % len(maps)]
+
+                match_doc = {
+                    "round_robin_id": rr_id,
+                    "tournament_id": ObjectId(tournament_id),
+                    "pod_a_id": None,
+                    "pod_b_id": None,
+                    "pod_a_name": "All Teams",
+                    "pod_b_name": "All Teams",
+                    "match_number": match_num,
+                    "map": map_name,
+                    "room_id": None,
+                    "room_password": None,
+                    "match_start_time": None,
+                    "full_lobby": True,
+                    "slot_limit": slot_limit,
+                    "participants": participants,
+                    "status": "scheduled",
+                    "results": [],
+                    "mvp": None,
+                    "created_at": datetime.utcnow(),
+                }
+                result = mongo.db.cross_pod_matches.insert_one(match_doc)
+                match_doc["_id"] = result.inserted_id
+                created_matches.append(match_doc)
+
+            return jsonify({
+                "message": f"Created {len(created_matches)} full-lobby matches",
+                "matches": [serialize_cross_pod_match(m) for m in created_matches]
+            })
+        else:
+            # Create new round-robin with full-lobby matches only
+            pod_ids = []
+            if stage_id:
+                pod_ids = [str(p["_id"]) for p in list(mongo.db.stage_pods.find({"stage_id": safe_object_id(stage_id)}))]
+
+            rr_doc = {
+                "tournament_id": ObjectId(tournament_id),
+                "stage_id": ObjectId(stage_id) if stage_id else None,
+                "name": name,
+                "pod_ids": pod_ids,
+                "matches_per_pair": 0,
+                "pairings": [],
+                "status": "active",
+                "created_at": datetime.utcnow(),
+            }
+            result = mongo.db.cross_pod_round_robin.insert_one(rr_doc)
+            rr_doc["_id"] = result.inserted_id
+
+            maps = ["Bermuda", "Pulgatory", "Kalahari", "Livik", "Sanhok"]
+            created_matches = []
+            for i in range(match_count):
+                match_num = i + 1
+                map_name = maps[i % len(maps)]
+                match_doc = {
+                    "round_robin_id": rr_doc["_id"],
+                    "tournament_id": ObjectId(tournament_id),
+                    "pod_a_id": None,
+                    "pod_b_id": None,
+                    "pod_a_name": "All Teams",
+                    "pod_b_name": "All Teams",
+                    "match_number": match_num,
+                    "map": map_name,
+                    "room_id": None,
+                    "room_password": None,
+                    "match_start_time": None,
+                    "full_lobby": True,
+                    "slot_limit": slot_limit,
+                    "participants": participants,
+                    "status": "scheduled",
+                    "results": [],
+                    "mvp": None,
+                    "created_at": datetime.utcnow(),
+                }
+                result = mongo.db.cross_pod_matches.insert_one(match_doc)
+                match_doc["_id"] = result.inserted_id
+                created_matches.append(match_doc)
+
+            return jsonify(serialize_round_robin(rr_doc, include_matches=True))
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 # ---------------- LIST ROUND ROBINS FOR A TOURNAMENT ----------------
 @cross_pod.route("/tournament/<tournament_id>", methods=["GET"])
 @jwt_required()
@@ -342,22 +499,38 @@ def get_cross_pod_match(match_id):
 
     out = serialize_cross_pod_match(m)
 
-    # Attach participants from both pods
-    for pod_id_field, key in [("pod_a_id", "pod_a_participants"), ("pod_b_id", "pod_b_participants")]:
-        pod = mongo.db.stage_pods.find_one({"_id": m[pod_id_field]})
-        if pod:
-            enriched = []
-            for pt in pod.get("participants", []):
-                part = dict(pt)
-                part["pod_name"] = pod.get("name", "")
-                if "team_leader" not in part:
-                    reg = mongo.db.registrations.find_one({"_id": safe_object_id(part.get("registration_id"))})
-                    if reg and reg.get("team_leader"):
-                        part["team_leader"] = reg["team_leader"]
-                enriched.append(part)
-            out[key] = enriched
-        else:
-            out[key] = []
+    # For full-lobby matches, use the stored participants
+    if m.get("full_lobby") and m.get("participants"):
+        enriched = []
+        for pt in m["participants"]:
+            part = dict(pt)
+            part["pod_name"] = "All Teams"
+            if "team_leader" not in part:
+                reg = mongo.db.registrations.find_one({"_id": safe_object_id(part.get("registration_id"))})
+                if reg and reg.get("team_leader"):
+                    part["team_leader"] = reg["team_leader"]
+            enriched.append(part)
+        out["participants"] = enriched
+    else:
+        # Attach participants from both pods
+        for pod_id_field, key in [("pod_a_id", "pod_a_participants"), ("pod_b_id", "pod_b_participants")]:
+            if m.get(pod_id_field):
+                pod = mongo.db.stage_pods.find_one({"_id": m[pod_id_field]})
+                if pod:
+                    enriched = []
+                    for pt in pod.get("participants", []):
+                        part = dict(pt)
+                        part["pod_name"] = pod.get("name", "")
+                        if "team_leader" not in part:
+                            reg = mongo.db.registrations.find_one({"_id": safe_object_id(part.get("registration_id"))})
+                            if reg and reg.get("team_leader"):
+                                part["team_leader"] = reg["team_leader"]
+                        enriched.append(part)
+                    out[key] = enriched
+                else:
+                    out[key] = []
+            else:
+                out[key] = []
 
     return jsonify(out)
 
@@ -420,14 +593,15 @@ def update_cross_pod_slots(match_id):
 
     data = request.get_json(silent=True) or {}
     slot_assignments = data.get("slot_assignments", {})
+    slot_limit = 12 if m.get("full_lobby") else 10
 
     if not isinstance(slot_assignments, dict):
         return jsonify({"error": "slot_assignments must be an object"}), 400
     for slot, reg_id in slot_assignments.items():
         try:
             slot_num = int(slot)
-            if slot_num < 1 or slot_num > 10:
-                return jsonify({"error": f"Invalid slot: {slot}. Must be 1-10"}), 400
+            if slot_num < 1 or slot_num > slot_limit:
+                return jsonify({"error": f"Invalid slot: {slot}. Must be 1-{slot_limit}"}), 400
         except ValueError:
             return jsonify({"error": f"Invalid slot key: {slot}"}), 400
 
@@ -452,19 +626,20 @@ def release_cross_pod_room(match_id):
     start_time = data.get("start_time")
     map_name = data.get("map")
     slot_assignments = data.get("slot_assignments", {})
+    slot_limit = 12 if m.get("full_lobby") else 10
 
     if not room_id or not password:
         return jsonify({"error": "Room ID and password are required"}), 400
 
-    # Validate slot assignments (10 slots max)
+    # Validate slot assignments
     if slot_assignments:
         if not isinstance(slot_assignments, dict):
             return jsonify({"error": "slot_assignments must be an object"}), 400
         for slot, reg_id in slot_assignments.items():
             try:
                 slot_num = int(slot)
-                if slot_num < 1 or slot_num > 10:
-                    return jsonify({"error": f"Invalid slot number: {slot}. Must be 1-10"}), 400
+                if slot_num < 1 or slot_num > slot_limit:
+                    return jsonify({"error": f"Invalid slot number: {slot}. Must be 1-{slot_limit}"}), 400
             except ValueError:
                 return jsonify({"error": f"Invalid slot key: {slot}"}), 400
 
@@ -478,32 +653,40 @@ def release_cross_pod_room(match_id):
         {"$set": update_fields}
     )
 
-    # Notify participants from both pods
+    # Notify participants - full lobby uses match participants, regular uses pods
     notified_user_ids = set()
-    for pod_id_field in ["pod_a_id", "pod_b_id"]:
-        pod = mongo.db.stage_pods.find_one({"_id": m[pod_id_field]})
-        if pod:
-            for participant in pod.get("participants", []):
-                if participant.get("user_id") and participant["user_id"] not in notified_user_ids:
-                    notified_user_ids.add(participant["user_id"])
-                    create_notification(
-                        mongo,
-                        participant["user_id"],
-                        f"Room is live for {m['pod_a_name']} vs {m['pod_b_name']} — Match {m['match_number']}. Check the standings page!",
-                        ntype="room",
-                        tournament_id=str(m["tournament_id"])
-                    )
-                for member in participant.get("team_members", []):
-                    member_uid = member.get("user_id")
-                    if member_uid and member_uid not in notified_user_ids:
-                        notified_user_ids.add(member_uid)
-                        create_notification(
-                            mongo,
-                            member_uid,
-                            f"Room is live for {m['pod_a_name']} vs {m['pod_b_name']} — Match {m['match_number']}. Check the standings page!",
-                            ntype="room",
-                            tournament_id=str(m["tournament_id"])
-                        )
+    participants_to_notify = []
+
+    if m.get("full_lobby") and m.get("participants"):
+        participants_to_notify = m["participants"]
+    else:
+        for pod_id_field in ["pod_a_id", "pod_b_id"]:
+            if m.get(pod_id_field):
+                pod = mongo.db.stage_pods.find_one({"_id": m[pod_id_field]})
+                if pod:
+                    participants_to_notify.extend(pod.get("participants", []))
+
+    for participant in participants_to_notify:
+        if participant.get("user_id") and participant["user_id"] not in notified_user_ids:
+            notified_user_ids.add(participant["user_id"])
+            create_notification(
+                mongo,
+                participant["user_id"],
+                f"Room is live for {m['pod_a_name']} vs {m['pod_b_name']} — Match {m['match_number']}. Check the standings page!",
+                ntype="room",
+                tournament_id=str(m["tournament_id"])
+            )
+        for member in participant.get("team_members", []):
+            member_uid = member.get("user_id")
+            if member_uid and member_uid not in notified_user_ids:
+                notified_user_ids.add(member_uid)
+                create_notification(
+                    mongo,
+                    member_uid,
+                    f"Room is live for {m['pod_a_name']} vs {m['pod_b_name']} — Match {m['match_number']}. Check the standings page!",
+                    ntype="room",
+                    tournament_id=str(m["tournament_id"])
+                )
 
     return jsonify({"message": "Room released"})
 
@@ -526,13 +709,18 @@ def submit_cross_pod_results(match_id):
         if not raw_results:
             return jsonify({"error": "No results submitted"}), 400
 
-        # Build name lookup from BOTH pods
+        # Build name lookup - full lobby uses match participants, regular uses pods
         name_lookup = {}
-        for pod_id_field in ["pod_a_id", "pod_b_id"]:
-            pod = mongo.db.stage_pods.find_one({"_id": m[pod_id_field]})
-            if pod:
-                for pt in pod.get("participants", []):
-                    name_lookup[pt["registration_id"]] = pt
+        if m.get("full_lobby") and m.get("participants"):
+            for pt in m["participants"]:
+                name_lookup[pt["registration_id"]] = pt
+        else:
+            for pod_id_field in ["pod_a_id", "pod_b_id"]:
+                if m.get(pod_id_field):
+                    pod = mongo.db.stage_pods.find_one({"_id": m[pod_id_field]})
+                    if pod:
+                        for pt in pod.get("participants", []):
+                            name_lookup[pt["registration_id"]] = pt
 
         prev_results = m.get("results", [])
 

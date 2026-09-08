@@ -20,6 +20,18 @@ def init_player_stats_routes(mongo_instance):
     global mongo
     mongo = mongo_instance
 
+
+def admin_required(fn):
+    @wraps(fn)
+    @jwt_required()
+    def wrapper(*args, **kwargs):
+        user_id = get_jwt_identity()
+        user = mongo.db.users.find_one({"_id": ObjectId(user_id)})
+        if not user or user.get("role") != "admin":
+            return jsonify({"error": "Admin access required"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
 def upsert_player_stats(
     user_id,
     game,
@@ -208,4 +220,52 @@ def increment_tournaments_won_endpoint():
             "tournaments_played": updated.get("tournaments_played", 0),
             "tournaments_won": updated.get("tournaments_won", 0),
         }
+    })
+
+
+# ---- ADMIN: RESET PLAYER LEADERBOARD ----
+
+@player_stats.route("/admin/reset-player-stats", methods=["POST"])
+@admin_required
+def reset_player_stats():
+    """Reset specific stat for a player. Admin only.
+
+    Expected payload:
+    {
+        "user_id": "the user id",
+        "stat": "tournaments_won" | "total_kills" | "tournaments_played",
+        "game": "BGMI" | "FREE_FIRE" | "GLOBAL"  (optional, defaults to GLOBAL)
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+    stat = data.get("stat", "tournaments_won")
+    game = (data.get("game") or "GLOBAL").strip().upper()
+
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+
+    user = mongo.db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    valid_stats = ["tournaments_won", "total_kills", "tournaments_played"]
+    if stat not in valid_stats:
+        return jsonify({"error": f"stat must be one of {valid_stats}"}), 400
+
+    # Update player_stats
+    mongo.db.player_stats.update_one(
+        {"user_id": user_id, "game": game},
+        {"$set": {stat: 0}}
+    )
+
+    # Also sync tournaments_won on users doc
+    if stat == "tournaments_won" and game == "GLOBAL":
+        mongo.db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"tournaments_won": 0}}
+        )
+
+    return jsonify({
+        "message": f"Reset {stat} to 0 for {user.get('name', user.get('username', user_id))} ({game})"
     })

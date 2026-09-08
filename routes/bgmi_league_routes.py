@@ -1,0 +1,876 @@
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from bson import ObjectId
+from bson.errors import InvalidId
+from datetime import datetime
+from functools import wraps
+
+from routes.notification_routes import create_notification
+from routes.player_stats_routes import upsert_player_stats
+from utils.player_stats import increment_tournaments_played
+
+bgmi_league = Blueprint("bgmi_league", __name__)
+mongo = None
+
+
+def init_bgmi_league_routes(mongo_instance):
+    global mongo
+    mongo = mongo_instance
+
+
+def safe_object_id(value):
+    try:
+        return ObjectId(value)
+    except (InvalidId, TypeError):
+        return None
+
+
+def admin_required(fn):
+    @wraps(fn)
+    @jwt_required()
+    def wrapper(*args, **kwargs):
+        user_id = get_jwt_identity()
+        user = mongo.db.users.find_one({"_id": safe_object_id(user_id)})
+        if not user or user.get("role") != "admin":
+            return jsonify({"error": "Admin access required"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def get_roster(tournament_id):
+    registrations = mongo.db.registrations.find({
+        "tournament_id": ObjectId(tournament_id),
+        "payment_status": {"$in": ["approved", "teammate"]}
+    })
+    roster = {}
+    for r in registrations:
+        rid = str(r["_id"])
+        if r.get("payment_status") == "teammate":
+            continue
+        team_name = r.get("team_name") or r.get("player_name", "Unknown")
+        members = r.get("team_members", [])
+        leader = r.get("team_leader", {})
+        roster[rid] = {
+            "registration_id": rid,
+            "user_id": r["user_id"],
+            "name": team_name,
+            "team_leader": leader,
+            "team_members": members,
+        }
+    return roster
+
+
+def serialize_match(m):
+    return {
+        "id": str(m["_id"]),
+        "league_id": str(m.get("league_id", "")),
+        "tournament_id": str(m.get("tournament_id", "")),
+        "match_number": m.get("match_number", 0),
+        "day": m.get("day", 1),
+        "map": m.get("map"),
+        "room_id": m.get("room_id"),
+        "room_password": m.get("room_password"),
+        "match_start_time": m.get("match_start_time").isoformat() if m.get("match_start_time") else None,
+        "status": m.get("status", "scheduled"),
+        "results": m.get("results", []),
+        "mvp": m.get("mvp"),
+        "slot_assignments": m.get("slot_assignments", {}),
+        "slot_limit": m.get("slot_limit", 11),
+        "participants": m.get("participants", []),
+        "created_at": m.get("created_at").isoformat() if m.get("created_at") else None,
+    }
+
+
+def serialize_league(rr, include_matches=False):
+    data = {
+        "id": str(rr["_id"]),
+        "tournament_id": str(rr.get("tournament_id", "")),
+        "name": rr.get("name", ""),
+        "status": rr.get("status", "active"),
+        "created_at": rr.get("created_at").isoformat() if rr.get("created_at") else None,
+    }
+    if include_matches:
+        matches = list(mongo.db.bgmi_league_matches.find(
+            {"league_id": rr["_id"]}
+        ).sort("day").sort("match_number"))
+        data["matches"] = [serialize_match(m) for m in matches]
+    return data
+
+
+# ---------------- CREATE LEAGUE ----------------
+@bgmi_league.route("/<tournament_id>/create", methods=["POST"])
+@admin_required
+def create_league(tournament_id):
+    """Create a BGMI league with full-lobby matches (all teams in every match).
+    Expects JSON: { name, match_count_per_day: [3, 3, 3] }
+    """
+    try:
+        t = mongo.db.tournaments.find_one({"_id": safe_object_id(tournament_id)})
+        if not t:
+            return jsonify({"error": "Tournament not found"}), 404
+
+        # Check if league already exists
+        existing = mongo.db.bgmi_league.find_one({"tournament_id": ObjectId(tournament_id)})
+        if existing:
+            return jsonify({"error": "League already exists for this tournament"}), 400
+
+        data = request.get_json(silent=True) or {}
+        name = data.get("name") or f"{t['name']} - League"
+        matches_per_day = data.get("matches_per_day") or [3, 3, 3]
+        custom_maps = data.get("maps")  # optional: list of maps per match
+
+        # Get all approved participants
+        roster = get_roster(tournament_id)
+        participants = list(roster.values())
+
+        if len(participants) < 2:
+            return jsonify({"error": "Need at least 2 approved participants"}), 400
+
+        slot_limit = max(len(participants), 10)
+
+        # Create league document
+        league_doc = {
+            "tournament_id": ObjectId(tournament_id),
+            "name": name,
+            "status": "active",
+            "created_at": datetime.utcnow(),
+        }
+        result = mongo.db.bgmi_league.insert_one(league_doc)
+        league_id = result.inserted_id
+
+        # Create matches
+        bgmi_maps = ["Erangel", "Miramar", "Sanhok", "Vikendi", "Livik", "Rondo"]
+        match_counter = 0
+        created_matches = []
+
+        for day_num, count in enumerate(matches_per_day, 1):
+            for i in range(count):
+                match_counter += 1
+                if custom_maps and match_counter <= len(custom_maps):
+                    map_name = custom_maps[match_counter - 1]
+                else:
+                    map_name = bgmi_maps[(match_counter - 1) % len(bgmi_maps)]
+
+                match_doc = {
+                    "league_id": league_id,
+                    "tournament_id": ObjectId(tournament_id),
+                    "match_number": match_counter,
+                    "day": day_num,
+                    "map": map_name,
+                    "room_id": None,
+                    "room_password": None,
+                    "match_start_time": None,
+                    "status": "scheduled",
+                    "results": [],
+                    "mvp": None,
+                    "slot_assignments": {},
+                    "slot_limit": slot_limit,
+                    "participants": participants,
+                    "created_at": datetime.utcnow(),
+                }
+                res = mongo.db.bgmi_league_matches.insert_one(match_doc)
+                match_doc["_id"] = res.inserted_id
+                created_matches.append(match_doc)
+
+        league = mongo.db.bgmi_league.find_one({"_id": league_id})
+        return jsonify({
+            "message": f"League created with {len(created_matches)} matches across {len(matches_per_day)} days",
+            "league": serialize_league(league, include_matches=True)
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------- GET LEAGUE ----------------
+@bgmi_league.route("/tournament/<tournament_id>", methods=["GET"])
+@jwt_required()
+def get_league(tournament_id):
+    rr = mongo.db.bgmi_league.find_one({"tournament_id": safe_object_id(tournament_id)})
+    if not rr:
+        return jsonify(None)
+    return jsonify(serialize_league(rr, include_matches=True))
+
+
+# ---------------- RELEASE ROOM ----------------
+@bgmi_league.route("/matches/<match_id>/room", methods=["POST"])
+@admin_required
+def release_room(match_id):
+    """Release room for a specific league match."""
+    match = mongo.db.bgmi_league_matches.find_one({"_id": safe_object_id(match_id)})
+    if not match:
+        return jsonify({"error": "Match not found"}), 404
+
+    data = request.json
+    room_id = data.get("room_id")
+    password = data.get("password")
+    start_time_raw = data.get("start_time")
+    slot_assignments = data.get("slot_assignments", {})
+
+    if not room_id or not password:
+        return jsonify({"error": "Room ID and password required"}), 400
+
+    start_time = None
+    if start_time_raw:
+        try:
+            start_time = datetime.fromisoformat(start_time_raw.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            return jsonify({"error": "Invalid start_time format"}), 400
+
+    # Validate slot assignments
+    slot_limit = match.get("slot_limit", 11)
+    if slot_assignments:
+        for slot, reg_id in slot_assignments.items():
+            try:
+                slot_num = int(slot)
+                if slot_num < 1 or slot_num > slot_limit:
+                    return jsonify({"error": f"Invalid slot: {slot}. Must be 1-{slot_limit}"}), 400
+            except ValueError:
+                return jsonify({"error": f"Invalid slot key: {slot}"}), 400
+
+    mongo.db.bgmi_league_matches.update_one(
+        {"_id": match["_id"]},
+        {"$set": {
+            "room_id": room_id,
+            "room_password": password,
+            "match_start_time": start_time,
+            "slot_assignments": slot_assignments,
+        }}
+    )
+
+    # Notify participants
+    tournament_id = str(match["tournament_id"])
+    t = mongo.db.tournaments.find_one({"_id": ObjectId(tournament_id)})
+    participants = mongo.db.registrations.find({
+        "tournament_id": ObjectId(tournament_id),
+        "payment_status": {"$in": ["approved", "teammate"]}
+    })
+    notified = set()
+    for r in participants:
+        uid = r["user_id"]
+        if uid in notified:
+            continue
+        notified.add(uid)
+        create_notification(
+            mongo, uid,
+            f"Room details for Match {match['match_number']} of \"{t.get('name') if t else 'tournament'}\" are live!",
+            ntype="room",
+            tournament_id=tournament_id
+        )
+        for member in r.get("team_members", []):
+            member_uid = member.get("user_id")
+            if member_uid and member_uid not in notified:
+                notified.add(member_uid)
+                create_notification(
+                    mongo, member_uid,
+                    f"Room details for Match {match['match_number']} of \"{t.get('name') if t else 'tournament'}\" are live!",
+                    ntype="room",
+                    tournament_id=tournament_id
+                )
+
+    return jsonify({"message": "Room released successfully"})
+
+
+# ---------------- UPDATE SLOTS ----------------
+@bgmi_league.route("/matches/<match_id>/slots", methods=["POST"])
+@admin_required
+def update_slots(match_id):
+    match = mongo.db.bgmi_league_matches.find_one({"_id": safe_object_id(match_id)})
+    if not match:
+        return jsonify({"error": "Match not found"}), 404
+
+    data = request.json
+    slot_assignments = data.get("slot_assignments", {})
+
+    mongo.db.bgmi_league_matches.update_one(
+        {"_id": match["_id"]},
+        {"$set": {"slot_assignments": slot_assignments}}
+    )
+    return jsonify({"message": "Slots updated"})
+
+
+# ---------------- SUBMIT RESULTS ----------------
+@bgmi_league.route("/matches/<match_id>/results", methods=["POST"])
+@admin_required
+def submit_results(match_id):
+    """Submit results for a league match."""
+    match = mongo.db.bgmi_league_matches.find_one({"_id": safe_object_id(match_id)})
+    if not match:
+        return jsonify({"error": "Match not found"}), 404
+
+    data = request.json
+    results = data.get("results", [])
+
+    if not results:
+        return jsonify({"error": "No results provided"}), 400
+
+    tournament_id = str(match["tournament_id"])
+    t = mongo.db.tournaments.find_one({"_id": ObjectId(tournament_id)})
+    points_table = t.get("points_table", {"1": 10, "2": 6, "3": 5, "4": 4, "5": 3, "6": 2, "7": 2, "8": 1, "9": 1})
+    kill_point_value = t.get("kill_point_value", 1)
+
+    processed_results = []
+    for r in results:
+        reg_id = r.get("registration_id")
+        placement = r.get("placement", 0)
+        kills = r.get("kills", 0)
+        players = r.get("players", [])
+
+        reg = mongo.db.registrations.find_one({"_id": safe_object_id(reg_id)})
+        name = "Unknown"
+        if reg:
+            name = reg.get("team_name") or reg.get("player_name", "Unknown")
+
+        pts = points_table.get(str(placement), 0) + (kills or 0) * kill_point_value
+
+        processed_results.append({
+            "registration_id": reg_id,
+            "name": name,
+            "placement": placement,
+            "kills": kills,
+            "points": pts,
+            "players": players,
+        })
+
+    # Calculate MVP
+    mvp = None
+    if processed_results:
+        best_score = -1
+        for r in processed_results:
+            player_kills = sum(p.get("kills", 0) for p in r.get("players", []))
+            score = player_kills * 10 + r.get("points", 0)
+            if score > best_score:
+                best_score = score
+                mvp = {
+                    "name": r["name"],
+                    "registration_id": r["registration_id"],
+                    "kills": r.get("kills", 0),
+                    "placement": r.get("placement", 0),
+                    "score": score,
+                }
+
+    # Save results
+    processed_results.sort(key=lambda x: x.get("placement", 999))
+    mongo.db.bgmi_league_matches.update_one(
+        {"_id": match["_id"]},
+        {"$set": {
+            "results": processed_results,
+            "mvp": mvp,
+            "status": "completed",
+        }}
+    )
+
+    # Update player stats — use per-player kills, NOT team kills
+    for r in processed_results:
+        reg = mongo.db.registrations.find_one({"_id": safe_object_id(r["registration_id"])})
+        if not reg:
+            continue
+
+        # Build name -> kills map from players array
+        players = r.get("players", [])
+        player_kills_map = {}
+        for pl in players:
+            player_kills_map[pl.get("name", "").strip().lower()] = pl.get("kills", 0)
+
+        # Leader
+        leader = reg.get("team_leader", {})
+        leader_name = leader.get("name", "").strip().lower()
+        if reg.get("user_id"):
+            leader_kills = player_kills_map.get(leader_name, 0)
+            upsert_player_stats(reg["user_id"], "BGMI", kills_delta=leader_kills)
+            increment_tournaments_played(mongo, reg["user_id"], "BGMI")
+
+        # Team members
+        for member in reg.get("team_members", []):
+            member_uid = member.get("user_id")
+            member_name = member.get("name", "").strip().lower()
+            if member_uid:
+                member_kills = player_kills_map.get(member_name, 0)
+                upsert_player_stats(member_uid, "BGMI", kills_delta=member_kills)
+                increment_tournaments_played(mongo, member_uid, "BGMI")
+
+    # Notify participants
+    registrations = mongo.db.registrations.find({
+        "tournament_id": ObjectId(tournament_id),
+        "payment_status": {"$in": ["approved", "teammate"]}
+    })
+    notified = set()
+    for reg in registrations:
+        uid = reg["user_id"]
+        if uid in notified:
+            continue
+        notified.add(uid)
+        create_notification(
+            mongo, uid,
+            f"Results for Match {match['match_number']} are out! Check the standings.",
+            ntype="results",
+            tournament_id=tournament_id
+        )
+        for member in reg.get("team_members", []):
+            member_uid = member.get("user_id")
+            if member_uid and member_uid not in notified:
+                notified.add(member_uid)
+                create_notification(
+                    mongo, member_uid,
+                    f"Results for Match {match['match_number']} are out! Check the standings.",
+                    ntype="results",
+                    tournament_id=tournament_id
+                )
+
+    return jsonify({"message": "Results submitted successfully"})
+
+
+# ---------------- GET MATCH DETAIL ----------------
+@bgmi_league.route("/matches/<match_id>", methods=["GET"])
+@jwt_required()
+def get_match(match_id):
+    match = mongo.db.bgmi_league_matches.find_one({"_id": safe_object_id(match_id)})
+    if not match:
+        return jsonify({"error": "Match not found"}), 404
+    return jsonify(serialize_match(match))
+
+
+# ---------------- BULK UPDATE MAPS ----------------
+@bgmi_league.route("/<league_id>/maps", methods=["PUT"])
+@admin_required
+def update_maps(league_id):
+    """Update maps for all matches in a league.
+    Expects JSON: { "maps": { "1": "Erangel", "2": "Miramar", ... } }
+    Keys are match numbers (as strings), values are map names.
+    """
+    data = request.get_json(silent=True) or {}
+    maps = data.get("maps", {})
+
+    league = mongo.db.bgmi_league.find_one({"_id": safe_object_id(league_id)})
+    if not league:
+        return jsonify({"error": "League not found"}), 404
+
+    updated = 0
+    for match_num_str, map_name in maps.items():
+        try:
+            match_num = int(match_num_str)
+        except ValueError:
+            continue
+        if not map_name or not isinstance(map_name, str):
+            continue
+        mongo.db.bgmi_league_matches.update_one(
+            {"league_id": league["_id"], "match_number": match_num},
+            {"$set": {"map": map_name.strip()}}
+        )
+        updated += 1
+
+    return jsonify({"message": f"Updated maps for {updated} matches"})
+
+
+# ---------------- STANDINGS ----------------
+@bgmi_league.route("/tournament/<tournament_id>/standings", methods=["GET"])
+@jwt_required()
+def get_standings(tournament_id):
+    """Calculate overall standings from all completed league matches."""
+    league = mongo.db.bgmi_league.find_one({"tournament_id": safe_object_id(tournament_id)})
+    if not league:
+        return jsonify([])
+
+    all_matches = list(mongo.db.bgmi_league_matches.find({
+        "league_id": league["_id"]
+    }))
+    completed_matches = [m for m in all_matches if m.get("status") == "completed"]
+
+    # Initialize all teams from participants (so they show even before results)
+    team_stats = {}
+    for m in all_matches:
+        for p in m.get("participants", []):
+            rid = p.get("registration_id")
+            if rid and rid not in team_stats:
+                team_stats[rid] = {
+                    "registration_id": rid,
+                    "name": p.get("name", "Unknown"),
+                    "matches_played": 0,
+                    "total_kills": 0,
+                    "total_points": 0,
+                    "chicken_dinners": 0,
+                    "best_placement": 999,
+                }
+
+    for m in completed_matches:
+        for r in m.get("results", []):
+            reg_id = r.get("registration_id")
+            if not reg_id:
+                continue
+            if reg_id not in team_stats:
+                team_stats[reg_id] = {
+                    "registration_id": reg_id,
+                    "name": r.get("name", "Unknown"),
+                    "matches_played": 0,
+                    "total_kills": 0,
+                    "total_points": 0,
+                    "chicken_dinners": 0,
+                    "best_placement": 999,
+                }
+            ts = team_stats[reg_id]
+            ts["matches_played"] += 1
+            ts["total_kills"] += r.get("kills", 0)
+            ts["total_points"] += r.get("points", 0)
+            if r.get("placement") == 1:
+                ts["chicken_dinners"] += 1
+            if r.get("placement", 999) < ts["best_placement"]:
+                ts["best_placement"] = r["placement"]
+
+    # Apply penalties
+    penalties = list(mongo.db.bgmi_league_penalties.find({"league_id": league["_id"]}))
+    for pen in penalties:
+        rid = str(pen.get("registration_id", ""))
+        if rid in team_stats:
+            team_stats[rid]["total_points"] -= pen.get("points", 0)
+            team_stats[rid]["penalties"] = team_stats[rid].get("penalties", 0) + pen.get("points", 0)
+
+    # Apply bonuses
+    bonuses = list(mongo.db.bgmi_league_bonuses.find({"league_id": league["_id"]}))
+    for bon in bonuses:
+        rid = str(bon.get("registration_id", ""))
+        if rid in team_stats:
+            team_stats[rid]["total_points"] += bon.get("points", 0)
+            team_stats[rid]["bonuses"] = team_stats[rid].get("bonuses", 0) + bon.get("points", 0)
+
+    # Sort by total_points, then total_kills
+    standings = sorted(team_stats.values(), key=lambda x: (-x["total_points"], -x["total_kills"]))
+    for i, s in enumerate(standings):
+        s["rank"] = i + 1
+
+    return jsonify(standings)
+
+
+# ---------------- DEDUCT POINTS (PENALTY) ----------------
+@bgmi_league.route("/<league_id>/penalty", methods=["POST"])
+@admin_required
+def deduct_points(league_id):
+    """Deduct points from a team as penalty.
+    Expects JSON: { registration_id, points, reason }
+    """
+    data = request.get_json(silent=True) or {}
+    reg_id = data.get("registration_id")
+    points = data.get("points", 0)
+    reason = data.get("reason", "")
+
+    if not reg_id:
+        return jsonify({"error": "registration_id required"}), 400
+    if not points or points <= 0:
+        return jsonify({"error": "Points must be positive"}), 400
+    if not reason:
+        return jsonify({"error": "Reason required"}), 400
+
+    league = mongo.db.bgmi_league.find_one({"_id": safe_object_id(league_id)})
+    if not league:
+        return jsonify({"error": "League not found"}), 404
+
+    # Store penalty
+    penalty_doc = {
+        "league_id": league["_id"],
+        "tournament_id": league["tournament_id"],
+        "registration_id": reg_id,
+        "points": points,
+        "reason": reason,
+        "created_at": datetime.utcnow(),
+    }
+    mongo.db.bgmi_league_penalties.insert_one(penalty_doc)
+
+    # Get team name
+    reg = mongo.db.registrations.find_one({"_id": safe_object_id(reg_id)})
+    team_name = reg.get("team_name") or reg.get("player_name", "Unknown") if reg else "Unknown"
+
+    return jsonify({"message": f"Deducted {points} points from {team_name}", "team_name": team_name})
+
+
+# ---------------- GET PENALTIES ----------------
+@bgmi_league.route("/<league_id>/penalties", methods=["GET"])
+@jwt_required()
+def get_penalties(league_id):
+    """Get all penalties for a league."""
+    league = mongo.db.bgmi_league.find_one({"_id": safe_object_id(league_id)})
+    if not league:
+        return jsonify([])
+
+    penalties = list(mongo.db.bgmi_league_penalties.find(
+        {"league_id": league["_id"]}
+    ).sort("created_at", -1))
+
+    result = []
+    for p in penalties:
+        reg = mongo.db.registrations.find_one({"_id": p.get("registration_id")})
+        result.append({
+            "id": str(p["_id"]),
+            "registration_id": str(p["registration_id"]),
+            "team_name": reg.get("team_name") or reg.get("player_name", "Unknown") if reg else "Unknown",
+            "points": p["points"],
+            "reason": p["reason"],
+            "created_at": p["created_at"].isoformat() if p.get("created_at") else None,
+        })
+
+    return jsonify(result)
+
+
+# ---------------- DELETE PENALTY ----------------
+@bgmi_league.route("/<league_id>/penalties/<penalty_id>", methods=["DELETE"])
+@admin_required
+def delete_penalty(league_id, penalty_id):
+    """Remove a penalty (refund points)."""
+    penalty = mongo.db.bgmi_league_penalties.find_one({"_id": safe_object_id(penalty_id)})
+    if not penalty:
+        return jsonify({"error": "Penalty not found"}), 404
+    mongo.db.bgmi_league_penalties.delete_one({"_id": penalty["_id"]})
+    return jsonify({"message": "Penalty removed, points refunded"})
+
+
+# ---------------- ADD BONUS POINTS ----------------
+@bgmi_league.route("/<league_id>/bonus", methods=["POST"])
+@admin_required
+def add_bonus(league_id):
+    """Give bonus points to a team.
+    Expects JSON: { registration_id, points, reason }
+    """
+    data = request.get_json(silent=True) or {}
+    reg_id = data.get("registration_id")
+    points = data.get("points", 0)
+    reason = data.get("reason", "")
+
+    if not reg_id:
+        return jsonify({"error": "registration_id required"}), 400
+    if not points or points <= 0:
+        return jsonify({"error": "Points must be positive"}), 400
+    if not reason:
+        return jsonify({"error": "Reason required"}), 400
+
+    league = mongo.db.bgmi_league.find_one({"_id": safe_object_id(league_id)})
+    if not league:
+        return jsonify({"error": "League not found"}), 404
+
+    bonus_doc = {
+        "league_id": league["_id"],
+        "tournament_id": league["tournament_id"],
+        "registration_id": reg_id,
+        "points": points,
+        "reason": reason,
+        "created_at": datetime.utcnow(),
+    }
+    mongo.db.bgmi_league_bonuses.insert_one(bonus_doc)
+
+    reg = mongo.db.registrations.find_one({"_id": safe_object_id(reg_id)})
+    team_name = reg.get("team_name") or reg.get("player_name", "Unknown") if reg else "Unknown"
+
+    return jsonify({"message": f"Added {points} bonus points to {team_name}", "team_name": team_name})
+
+
+# ---------------- GET BONUSES ----------------
+@bgmi_league.route("/<league_id>/bonuses", methods=["GET"])
+@jwt_required()
+def get_bonuses(league_id):
+    """Get all bonuses for a league."""
+    league = mongo.db.bgmi_league.find_one({"_id": safe_object_id(league_id)})
+    if not league:
+        return jsonify([])
+
+    bonuses = list(mongo.db.bgmi_league_bonuses.find(
+        {"league_id": league["_id"]}
+    ).sort("created_at", -1))
+
+    result = []
+    for b in bonuses:
+        reg = mongo.db.registrations.find_one({"_id": b.get("registration_id")})
+        result.append({
+            "id": str(b["_id"]),
+            "registration_id": str(b["registration_id"]),
+            "team_name": reg.get("team_name") or reg.get("player_name", "Unknown") if reg else "Unknown",
+            "points": b["points"],
+            "reason": b["reason"],
+            "created_at": b["created_at"].isoformat() if b.get("created_at") else None,
+        })
+
+    return jsonify(result)
+
+
+# ---------------- DELETE BONUS ----------------
+@bgmi_league.route("/<league_id>/bonuses/<bonus_id>", methods=["DELETE"])
+@admin_required
+def delete_bonus(league_id, bonus_id):
+    """Remove a bonus (deduct back)."""
+    bonus = mongo.db.bgmi_league_bonuses.find_one({"_id": safe_object_id(bonus_id)})
+    if not bonus:
+        return jsonify({"error": "Bonus not found"}), 404
+    mongo.db.bgmi_league_bonuses.delete_one({"_id": bonus["_id"]})
+    return jsonify({"message": "Bonus removed, points deducted back"})
+
+
+# ---------------- BGMI LEAGUE STATS ----------------
+@bgmi_league.route("/tournament/<tournament_id>/stats", methods=["GET"])
+@jwt_required()
+def get_bgmi_stats(tournament_id):
+    """Return team frags, individual frags, and MVP leaderboard for BGMI league."""
+    league = mongo.db.bgmi_league.find_one({"tournament_id": safe_object_id(tournament_id)})
+    if not league:
+        return jsonify({"team_frags": [], "individual_frags": [], "mvp_leaderboard": []})
+
+    all_matches = list(mongo.db.bgmi_league_matches.find({
+        "league_id": league["_id"]
+    }))
+    completed_matches = [m for m in all_matches if m.get("status") == "completed"]
+
+    team_totals = {}
+    player_totals = {}
+    mvp_counts = {}
+
+    # Initialize all teams from participants
+    for m in all_matches:
+        for p in m.get("participants", []):
+            rid = p.get("registration_id")
+            if rid:
+                team_totals.setdefault(rid, {
+                    "registration_id": rid, "name": p.get("name", "Unknown"),
+                    "total_points": 0, "total_kills": 0, "matches_played": 0, "chicken_dinners": 0
+                })
+
+    for m in completed_matches:
+        for r in m.get("results", []):
+            rid = r.get("registration_id")
+            if not rid:
+                continue
+
+            team = team_totals.setdefault(rid, {
+                "registration_id": rid, "name": r.get("name", "Unknown"),
+                "total_points": 0, "total_kills": 0, "matches_played": 0, "chicken_dinners": 0
+            })
+            team["total_points"] += r.get("points", 0)
+            team["total_kills"] += r.get("kills", 0)
+            team["matches_played"] += 1
+            if r.get("placement") == 1:
+                team["chicken_dinners"] += 1
+
+            players = r.get("players") or [{"name": r["name"], "kills": r.get("kills", 0)}]
+            for pl in players:
+                key = f"{rid}::{pl['name']}"
+                entry = player_totals.setdefault(key, {
+                    "name": pl["name"], "team_name": r["name"], "registration_id": rid, "total_kills": 0
+                })
+                entry["total_kills"] += pl.get("kills", 0)
+
+        mvp = m.get("mvp")
+        if mvp:
+            key = f"{mvp.get('registration_id', '')}::{mvp['name']}"
+            entry = mvp_counts.setdefault(key, {
+                "name": mvp["name"], "team_name": mvp.get("team_name", ""), "count": 0
+            })
+            entry["count"] += 1
+
+    def ranked(items, sort_key):
+        out = sorted(items, key=sort_key)
+        for i, x in enumerate(out):
+            x["rank"] = i + 1
+        return out
+
+    return jsonify({
+        "team_frags": ranked(list(team_totals.values()), lambda x: -x["total_kills"]),
+        "individual_frags": ranked(list(player_totals.values()), lambda x: -x["total_kills"]),
+        "mvp_leaderboard": ranked(list(mvp_counts.values()), lambda x: -x["count"]),
+    })
+
+
+# ---------------- FINALIZE LEAGUE ----------------
+@bgmi_league.route("/<league_id>/finalize", methods=["POST"])
+@admin_required
+def finalize_league(league_id):
+    """Finalize the league and declare winner."""
+    league = mongo.db.bgmi_league.find_one({"_id": safe_object_id(league_id)})
+    if not league:
+        return jsonify({"error": "League not found"}), 404
+
+    # Check all matches completed
+    matches = list(mongo.db.bgmi_league_matches.find({"league_id": league["_id"]}))
+    incomplete = [m for m in matches if m.get("status") != "completed"]
+    if incomplete:
+        return jsonify({"error": f"{len(incomplete)} matches still incomplete"}), 400
+
+    # Calculate final standings
+    tournament_id = str(league["tournament_id"])
+    team_stats = {}
+    for m in matches:
+        for r in m.get("results", []):
+            reg_id = r.get("registration_id")
+            if not reg_id:
+                continue
+            if reg_id not in team_stats:
+                team_stats[reg_id] = {
+                    "registration_id": reg_id,
+                    "name": r.get("name", "Unknown"),
+                    "total_kills": 0,
+                    "total_points": 0,
+                }
+            ts = team_stats[reg_id]
+            ts["total_kills"] += r.get("kills", 0)
+            ts["total_points"] += r.get("points", 0)
+
+    standings = sorted(team_stats.values(), key=lambda x: (-x["total_points"], -x["total_kills"]))
+
+    if standings:
+        winner = standings[0]
+        winner_reg = mongo.db.registrations.find_one({"_id": safe_object_id(winner["registration_id"])})
+        winner_user_id = winner_reg["user_id"] if winner_reg else None
+
+        mongo.db.tournaments.update_one(
+            {"_id": ObjectId(tournament_id)},
+            {"$set": {
+                "winner_id": winner_user_id,
+                "winner_registration_id": winner["registration_id"],
+                "winner_name": winner["name"],
+                "winner_source": "bgmi_league",
+                "status": "completed",
+            }}
+        )
+
+        # Notify all participants
+        registrations = mongo.db.registrations.find({
+            "tournament_id": ObjectId(tournament_id),
+            "payment_status": {"$in": ["approved", "teammate"]}
+        })
+        notified = set()
+        for reg in registrations:
+            uid = reg["user_id"]
+            if uid in notified:
+                continue
+            notified.add(uid)
+            create_notification(
+                mongo, uid,
+                f"League finalized! Winner: {winner['name']}. Congratulations!",
+                ntype="winner",
+                tournament_id=tournament_id
+            )
+            for member in reg.get("team_members", []):
+                member_uid = member.get("user_id")
+                if member_uid and member_uid not in notified:
+                    notified.add(member_uid)
+                    create_notification(
+                        mongo, member_uid,
+                        f"League finalized! Winner: {winner['name']}. Congratulations!",
+                        ntype="winner",
+                        tournament_id=tournament_id
+                    )
+
+    mongo.db.bgmi_league.update_one(
+        {"_id": league["_id"]},
+        {"$set": {"status": "completed"}}
+    )
+
+    return jsonify({"message": "League finalized", "winner": standings[0]["name"] if standings else None})
+
+
+# ---------------- DELETE LEAGUE ----------------
+@bgmi_league.route("/<league_id>", methods=["DELETE"])
+@admin_required
+def delete_league(league_id):
+    league = mongo.db.bgmi_league.find_one({"_id": safe_object_id(league_id)})
+    if not league:
+        return jsonify({"error": "League not found"}), 404
+
+    mongo.db.bgmi_league_matches.delete_many({"league_id": league["_id"]})
+    mongo.db.bgmi_league.delete_one({"_id": league["_id"]})
+    return jsonify({"message": "League deleted"})

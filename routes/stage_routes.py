@@ -62,17 +62,29 @@ def get_roster_by_id(tournament_id):
     """registration_id -> {registration_id, user_id, name, team_members, team_leader} for every approved entry."""
     registrations = mongo.db.registrations.find({
         "tournament_id": ObjectId(tournament_id),
-        "payment_status": "approved"
+        "payment_status": {"$nin": ["rejected", "disqualified"]}
     })
     roster = {}
+    seen_keys = set()
     for r in registrations:
+        team_name = r.get("team_name")
+        team_members = r.get("team_members", []) or []
+
+        # Build dedup key: sorted member IDs catch duplicate squad registrations
+        member_ids = sorted([str(mid) for mid in team_members])
+        dedup_key = "|".join(member_ids) if member_ids else str(r.get("user_id", ""))
+
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+
         user = mongo.db.users.find_one({"_id": safe_object_id(r.get("user_id"))})
-        display_name = r.get("team_name") or (user.get("name") if user else "Unknown")
+        display_name = team_name or (user.get("name") if user else "Unknown")
         roster[str(r["_id"])] = {
             "registration_id": str(r["_id"]),
             "user_id": r.get("user_id"),
             "name": display_name,
-            "team_members": r.get("team_members", []),
+            "team_members": team_members,
             "team_leader": r.get("team_leader")
         }
     return roster
@@ -1068,9 +1080,10 @@ def fix_kill_stats():
     kill_deltas = {}
     tp_counts = {}
 
-    # Include BOTH stage_matches AND cross_pod_matches
+    # Include stage_matches, cross_pod_matches, AND bgmi_league_matches
     all_matches = list(mongo.db.stage_matches.find({"status": "completed"}))
     all_matches += list(mongo.db.cross_pod_matches.find({"status": "completed"}))
+    all_matches += list(mongo.db.bgmi_league_matches.find({"status": "completed"}))
 
     for m in all_matches:
         tid = m.get("tournament_id")
@@ -1096,12 +1109,38 @@ def fix_kill_stats():
                         if pt.get("user_id"):
                             pod_user[pt["registration_id"]] = pt["user_id"]
 
+        # For bgmi_league_matches, get user_id mapping from match participants
+        if m.get("participants"):
+            for pt in m["participants"]:
+                if pt.get("user_id"):
+                    pod_user[pt["registration_id"]] = pt["user_id"]
+                    # Also map member user_ids by name
+                    for member in pt.get("team_members", []):
+                        if member.get("user_id"):
+                            pod_user[f"{pt['registration_id']}::{member.get('name', '')}"] = member["user_id"]
+
         for res in m.get("results", []):
             rid = res.get("registration_id")
             players = res.get("players") or []
             if players:
                 for pl in players:
                     uid = pl.get("user_id")
+                    # If no user_id in player, look up by name from participants
+                    if not uid and m.get("participants"):
+                        pl_name = pl.get("name", "").strip().lower()
+                        for pt in m["participants"]:
+                            # Check leader
+                            leader = pt.get("team_leader", {})
+                            if leader.get("name", "").strip().lower() == pl_name and pt.get("user_id"):
+                                uid = pt["user_id"]
+                                break
+                            # Check team members
+                            for member in pt.get("team_members", []):
+                                if member.get("name", "").strip().lower() == pl_name and member.get("user_id"):
+                                    uid = member["user_id"]
+                                    break
+                            if uid:
+                                break
                     if not uid:
                         continue
                     kills = pl.get("kills", 0) or 0
