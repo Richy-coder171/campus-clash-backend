@@ -301,8 +301,10 @@ def public_profile(user_id):
 @jwt_required(refresh=True)
 def refresh_token():
     identity = get_jwt_identity()
-    claims = get_jwt()
-    role = claims.get("role", "user")
+    # Refresh tokens don't carry a role claim — read the user's current
+    # role from the DB so it survives token refreshes (incl. admins).
+    user = mongo.db.users.find_one({"_id": ObjectId(identity)})
+    role = (user or {}).get("role", "user")
     new_token = create_access_token(identity=identity, additional_claims={"role": role})
     return jsonify({"token": new_token})
 
