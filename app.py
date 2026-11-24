@@ -17,6 +17,7 @@ from routes.feedback_routes import feedbacks, init_feedback_routes
 from routes.bgmi_league_routes import bgmi_league, init_bgmi_league_routes
 from chat_events import register_chat_events
 from flask import send_from_directory, request, make_response
+import os
 
 
 
@@ -31,7 +32,12 @@ CORS(app, supports_credentials=True, origins=[
 
 mongo = PyMongo(app)
 jwt = JWTManager(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+allowed_origins = [
+    "https://campus-clash-og.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+socketio = SocketIO(app, cors_allowed_origins=allowed_origins, async_mode="threading")
 
 # Inject mongo into route files
 init_auth_routes(mongo)
@@ -103,4 +109,5 @@ def health():
     return {"status": "online", "provider": "Groq", "models": "GROQ_MODELS"}
 
 if __name__ == "__main__":
-    socketio.run(app, debug=True, allow_unsafe_werkzeug=True)
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+    socketio.run(app, debug=debug)

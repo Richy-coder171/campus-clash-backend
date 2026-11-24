@@ -5,9 +5,9 @@ from datetime import timedelta
 load_dotenv()
 
 class Config:
-    SECRET_KEY = os.getenv("SECRET_KEY", "fallback-secret")
+    SECRET_KEY = os.getenv("SECRET_KEY")
     MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/campus_clash")
-    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "jwt-secret")
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=10)
     # Refresh tokens live longer so the frontend can obtain new access tokens
     JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=30)

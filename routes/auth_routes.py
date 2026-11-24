@@ -67,8 +67,8 @@ def google_login():
         if not email:
             return jsonify({"error": "No email in Google token"}), 401
 
-    except Exception as e:
-        return jsonify({"error": f"Google verification failed: {str(e)}"}), 401
+    except Exception:
+        return jsonify({"error": "Google verification failed"}), 401
 
     users = mongo.db.users
     user = users.find_one({"email": email})
@@ -171,15 +171,19 @@ def register():
 # LOGIN
 @auth.route("/login", methods=["POST"])
 def login():
-    data = request.json
+    data = request.json or {}
     users = mongo.db.users
+    email = data.get("email")
+    password = data.get("password")
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
 
-    user = users.find_one({"email": data["email"]})
+    user = users.find_one({"email": email})
 
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    if not check_password_hash(user["password"], data["password"]):
+    if not check_password_hash(user["password"], password):
         return jsonify({"error": "Wrong password"}), 401
 
     token = create_access_token(
